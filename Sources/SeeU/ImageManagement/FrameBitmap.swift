@@ -31,7 +31,7 @@ nonisolated final class FrameBitmap: @unchecked Sendable {
     private let bytesPerRow: Int
     private let pixels: [UInt8]
 
-    init(imageData: Data, limits: SeeUImageLimits) throws {
+    convenience init(imageData: Data, limits: SeeUImageLimits) throws {
         guard imageData.count <= limits.maximumEncodedBytes else { throw SeeUImageError.encodedSizeExceeded }
         guard let source = CGImageSourceCreateWithData(imageData as CFData,
                 [kCGImageSourceShouldCache: false] as CFDictionary),
@@ -50,6 +50,15 @@ nonisolated final class FrameBitmap: @unchecked Sendable {
                 [kCGImageSourceShouldCacheImmediately: true] as CFDictionary),
               decoded.width == width, decoded.height == height
         else { throw SeeUImageError.invalidImage }
+        try self.init(image: decoded)
+    }
+
+    /// 已经过输入预算检查的裁剪图，用于原像素对齐和接缝评分。
+    init(image: CGImage) throws {
+        let width = image.width, height = image.height
+        guard width > 0, height > 0, width <= Int.max / 4 / height else {
+            throw SeeUImageError.pixelBudgetExceeded
+        }
         let bytesPerRow = width * 4
         var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
         let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
@@ -60,11 +69,11 @@ nonisolated final class FrameBitmap: @unchecked Sendable {
                 bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
             ) else { return false }
             // CGContext 的内存第 0 行对应图像顶部，所以下面按左上原点取像素。
-            context.draw(decoded, in: CGRect(x: 0, y: 0, width: width, height: height))
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
             return true
         }
         guard drawn else { throw SeeUImageError.invalidImage }
-        self.image = decoded
+        self.image = image
         self.width = width
         self.height = height
         self.bytesPerRow = bytesPerRow
@@ -131,8 +140,8 @@ nonisolated final class FrameBitmap: @unchecked Sendable {
                 var sum = 0.0
                 for sy in 0..<3 {
                     for sx in 0..<3 {
-                        let x = (col * width + (sx * 2 + 1) * width / (cols * 6)) / cols
-                        let y = (row * height + (sy * 2 + 1) * height / (rows * 6)) / rows
+                        let x = col * width / cols + (sx * 2 + 1) * width / (cols * 6)
+                        let y = row * height / rows + (sy * 2 + 1) * height / (rows * 6)
                         sum += color(x: x, y: y).luma
                     }
                 }
@@ -164,6 +173,22 @@ nonisolated final class FrameBitmap: @unchecked Sendable {
         CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { return nil }
         return data as Data
+    }
+
+    static func encodePNG(_ image: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)
+        else { return nil }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return data as Data
+    }
+
+    func pngStrip(y: Int, height stripHeight: Int) -> Data? {
+        let top = max(0, y), bottom = min(height, y + stripHeight)
+        guard bottom > top, let cropped = image.cropping(to: CGRect(x: 0, y: top, width: width, height: bottom - top))
+        else { return nil }
+        return Self.encodePNG(cropped)
     }
 
     static func decodeJPEG(_ data: Data) -> CGImage? {

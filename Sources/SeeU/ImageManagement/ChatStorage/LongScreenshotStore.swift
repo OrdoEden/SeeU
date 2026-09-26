@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 nonisolated public struct LongScreenshotSummary: Sendable {
@@ -64,24 +65,27 @@ public actor LongScreenshotStore {
             target = ChatLadder(width: bitmap.width, capacity: capacity)
             ladders[placement.segmentID] = target
         }
-        let header: (jpeg: Data, height: Int)? = parsed.titleAnchored
-            ? bitmap.jpegStrip(y: 0, height: Int(parsed.headerBottom)).map { ($0, Int(parsed.headerBottom)) } : nil
+        let headerRect = CGRect(x: 0, y: 0, width: CGFloat(bitmap.width), height: parsed.headerBottom)
+        let header: (jpeg: Data, height: Int)? = parsed.titleAnchored && !parsed.occluders.contains(where: { $0.intersects(headerRect) })
+            ? bitmap.pngStrip(y: 0, height: Int(parsed.headerBottom)).map { ($0, Int(parsed.headerBottom)) } : nil
         let footerTop = Int(parsed.contentBottom.rounded())
-        let footer: (jpeg: Data, height: Int)? = parsed.keyboardVisible
-            ? nil : bitmap.jpegStrip(y: footerTop, height: bitmap.height - footerTop).map { ($0, bitmap.height - footerTop) }
+        let footerRect = CGRect(x: 0, y: footerTop, width: bitmap.width, height: bitmap.height - footerTop)
+        let footer: (jpeg: Data, height: Int)? = parsed.keyboardVisible || parsed.occluders.contains(where: { $0.intersects(footerRect) })
+            ? nil : bitmap.pngStrip(y: footerTop, height: bitmap.height - footerTop).map { ($0, bitmap.height - footerTop) }
         target.add(bitmap: bitmap, contentTop: parsed.contentTop, contentBottom: parsed.contentBottom,
                    offset: placement.offset, bubbleRects: parsed.bubbles.map(\.rect),
-                   capturedAt: parsed.capturedAt, header: header, footer: footer)
+                   capturedAt: parsed.capturedAt, header: header, footer: footer, exclusions: parsed.occluders,
+                   seamRange: placement.matchingRange)
         ladders = ladders.filter { input.activeSegmentIDs.contains($0.key) }
     }
 
     public func render(maxPixelHeight: Int) -> Data? {
         guard let preferredSegmentID, let ladder = ladders[preferredSegmentID],
               let image = ladder.render(maxPixelHeight: maxPixelHeight) else { return nil }
-        return FrameBitmap.encodeJPEG(image, quality: 0.85)
+        return FrameBitmap.encodeJPEG(image, quality: 0.92)
     }
 
     public func summary() -> [UUID: LongScreenshotSummary] {
-        ladders.mapValues { LongScreenshotSummary(imageSpan: $0.span, rungCount: $0.rungs.count) }
+        ladders.mapValues { LongScreenshotSummary(imageSpan: $0.span, rungCount: $0.rungCount) }
     }
 }

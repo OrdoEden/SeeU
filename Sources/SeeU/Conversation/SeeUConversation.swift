@@ -1,32 +1,6 @@
 import CoreGraphics
 import Foundation
 
-/// OCR 观察证据。observedAt 是截图时间，不是消息发送时间。
-/// 坐标为原图像素、左上原点；每条历史消息仅保留最近三次证据。
-nonisolated public struct SeeUObservation: Codable, Sendable, Equatable {
-    public let frameID: UUID
-    public let observedAt: Date
-    public let pixelWidth: Double
-    public let pixelHeight: Double
-    public let x: Double
-    public let y: Double
-    public let width: Double
-    public let height: Double
-    public let recognitionConfidence: Float?
-
-    init(frame: ParsedChatFrame, bubble: ChatBubble) {
-        frameID = frame.frameID
-        observedAt = frame.capturedAt
-        pixelWidth = Double(frame.pixelSize.width)
-        pixelHeight = Double(frame.pixelSize.height)
-        x = Double(bubble.rect.minX)
-        y = Double(bubble.rect.minY)
-        width = Double(bubble.rect.width)
-        height = Double(bubble.rect.height)
-        recognitionConfidence = bubble.recognitionConfidence
-    }
-}
-
 nonisolated public struct SeeUConversationItem: Codable, Sendable, Equatable {
     public let id: UUID
     public let kind: BubbleKind
