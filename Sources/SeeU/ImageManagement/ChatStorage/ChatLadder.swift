@@ -79,4 +79,11 @@ nonisolated final class ChatLadder {
         }
         return canvas.render(maxPixelHeight: maxPixelHeight, header: headerImage, footer: footerImage)
     }
+
+    /// The bottom four screenshot-widths of the composed body, without navigation or input bars.
+    func renderRecent(maxPixelHeight: Int) -> CGImage? {
+        guard let top, let bottom, bottom > top else { return nil }
+        let lowerBound = max(top, bottom - CGFloat(width) * 4)
+        return canvas.render(maxPixelHeight: maxPixelHeight, bodyRange: lowerBound...bottom)
+    }
 }

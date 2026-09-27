@@ -73,6 +73,9 @@ nonisolated public struct ParsedChatFrame: Sendable {
 
     public var messageBubbles: [ChatBubble] { bubbles.filter { $0.kind == .message } }
 
+    /// 气泡上方出现昵称，通常说明是群聊；头像提取等按单聊假设的能力应跳过。
+    public var showsSenderNames: Bool { bubbles.contains { $0.senderName != nil } }
+
     /// 单张截图足够清楚即可分析；无标题时需要更强的版式或输入栏证据。
     public var hasReliableSingleFrameEvidence: Bool {
         guard isChat else { return false }

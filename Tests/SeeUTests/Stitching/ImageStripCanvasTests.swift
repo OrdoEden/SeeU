@@ -134,6 +134,45 @@ final class ImageStripCanvasTests: XCTestCase {
         }
     }
 
+    func testBodyViewportMatchesFullCompositionAcrossSeamAndExclusions() throws {
+        let canvas = ImageStripCanvas(width: 40)
+        let earlier = try bitmap { _, y in (70...74).contains(y) ? (20, 20, 210) : (210, 20, 20) }
+        let later = try bitmap { _, y in (10...14).contains(y) ? (20, 20, 210) : (20, 210, 20) }
+        let rect = CGRect(x: 0, y: 0, width: 40, height: 100)
+        XCTAssertTrue(canvas.add(bitmap: earlier, rect: rect, offset: 0, capturedAt: time(1)))
+        XCTAssertTrue(canvas.add(bitmap: later, rect: rect, offset: 60,
+                                 exclusions: [CGRect(x: 10, y: 20, width: 20, height: 15),
+                                              CGRect(x: 10, y: 65, width: 20, height: 15)],
+                                 capturedAt: time(2), seamRange: 11...13))
+
+        let full = try rendered(canvas)
+        let explicitFull = try FrameBitmap(image: XCTUnwrap(canvas.render(maxPixelHeight: 10_000,
+                                                                         bodyRange: 0...160)))
+        let viewport = try FrameBitmap(image: XCTUnwrap(canvas.render(maxPixelHeight: 10_000,
+                                                                     bodyRange: 50...150)))
+        XCTAssertEqual(full.height, 160)
+        XCTAssertEqual(explicitFull.height, full.height)
+        XCTAssertEqual(viewport.width, full.width)
+        XCTAssertEqual(viewport.height, 100)
+        for y in 0..<full.height {
+            for x in 0..<full.width {
+                XCTAssertEqual(explicitFull.color(x: x, y: y), full.color(x: x, y: y))
+                if (50..<150).contains(y) {
+                    XCTAssertEqual(viewport.color(x: x, y: y - 50), full.color(x: x, y: y))
+                }
+            }
+        }
+        // The viewport contains the selected seam, older pixels behind an occluder, and an unfilled hole.
+        XCTAssertGreaterThan(viewport.color(x: 20, y: 19).r, 200)
+        XCTAssertGreaterThan(viewport.color(x: 20, y: 22).b, 200)
+        XCTAssertGreaterThan(viewport.color(x: 20, y: 25).g, 200)
+        XCTAssertGreaterThan(viewport.color(x: 20, y: 35).r, 200)
+        let hole = viewport.color(x: 20, y: 80)
+        XCTAssertEqual(hole.r, hole.g, accuracy: 1)
+        XCTAssertGreaterThan(hole.g, 220)
+        XCTAssertNil(canvas.render(maxPixelHeight: 10_000, bodyRange: 170...180))
+    }
+
     func testCanvasHasNoImplicitTenStripLimitAndRejectsInvalidInputAtomically() throws {
         let canvas = ImageStripCanvas(width: 40)
         let image = try bitmap { _, _ in (210, 20, 20) }

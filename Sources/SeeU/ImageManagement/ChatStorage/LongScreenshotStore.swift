@@ -85,6 +85,15 @@ public actor LongScreenshotStore {
         return FrameBitmap.encodeJPEG(image, quality: 0.92)
     }
 
+    /// A bounded bottom viewport for avatar extraction, composed with the same occlusion/seam rules.
+    /// Identity is checked inside the actor so queued work cannot read another conversation's pixels.
+    public func renderRecent(sessionID: UUID, conversationID: UUID, maxPixelHeight: Int = 4096) -> Data? {
+        guard self.sessionID == sessionID, self.conversationID == conversationID,
+              let preferredSegmentID, let ladder = ladders[preferredSegmentID],
+              let image = ladder.renderRecent(maxPixelHeight: maxPixelHeight) else { return nil }
+        return FrameBitmap.encodeJPEG(image, quality: 0.92)
+    }
+
     public func summary() -> [UUID: LongScreenshotSummary] {
         ladders.mapValues { LongScreenshotSummary(imageSpan: $0.span, rungCount: $0.rungCount) }
     }

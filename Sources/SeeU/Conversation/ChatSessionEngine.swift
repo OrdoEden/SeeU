@@ -171,7 +171,9 @@ public actor ChatSessionEngine {
         }
         let screenshotInput: LongScreenshotInput? = placement.map {
             LongScreenshotInput(epoch: frameEpoch, sessionID: frameSession, conversationID: conversationID,
-                                frameID: frameID, bitmap: bitmap, parsed: parsed, placement: $0,
+                                frameID: frameID, bitmap: bitmap, parsed: parsed,
+                                messageIDs: currentFrameItems.map { $0.kind == .message ? $0.id : nil },
+                                placement: $0,
                                 activeSegmentIDs: Set(stitcher.segments.map(\.id)), preferredSegmentID: $0.segmentID)
         }
         anchors.record(parsed)

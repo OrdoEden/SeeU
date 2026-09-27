@@ -120,8 +120,16 @@ nonisolated final class ImageStripCanvas {
         return retained
     }
 
-    func render(maxPixelHeight: Int, header: CGImage? = nil, footer: CGImage? = nil) -> CGImage? {
-        guard width > 0, maxPixelHeight > 0, let top, let bottom else { return nil }
+    /// bodyRange limits output before allocation; source selection and exclusion masks remain unchanged.
+    func render(maxPixelHeight: Int, header: CGImage? = nil, footer: CGImage? = nil,
+                bodyRange: ClosedRange<CGFloat>? = nil) -> CGImage? {
+        guard width > 0, maxPixelHeight > 0, let canvasTop = top, let canvasBottom = bottom else { return nil }
+        if let bodyRange {
+            guard Self.safeCoordinate(bodyRange.lowerBound), Self.safeCoordinate(bodyRange.upperBound) else { return nil }
+        }
+        let top = max(canvasTop, bodyRange?.lowerBound ?? canvasTop)
+        let bottom = min(canvasBottom, bodyRange?.upperBound ?? canvasBottom)
+        guard bottom > top else { return nil }
         let headerHeight = header.map { CGFloat($0.height) * CGFloat(width) / CGFloat($0.width) } ?? 0
         let footerHeight = footer.map { CGFloat($0.height) * CGFloat(width) / CGFloat($0.width) } ?? 0
         let fullHeight = headerHeight + bottom - top + footerHeight

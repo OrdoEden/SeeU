@@ -8,6 +8,9 @@ nonisolated public struct LongScreenshotInput: Sendable {
     public let frameID: UUID
     let bitmap: FrameBitmap
     public let parsed: ParsedChatFrame
+    /// 与 `parsed.bubbles` 一一对应的会话条目 ID；时间线等非消息条目为 nil。
+    /// 图片区域据此定位到前后消息，宿主可把图片插回文字上下文。
+    public let messageIDs: [UUID?]
     public let placement: StitchPlacement
     public let activeSegmentIDs: Set<UUID>
     public let preferredSegmentID: UUID

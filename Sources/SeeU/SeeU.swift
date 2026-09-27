@@ -2,3 +2,4 @@
 public typealias SeeUConversationEngine = ChatSessionEngine
 public typealias SeeULongScreenshotStore = LongScreenshotStore
 public typealias SeeUImageStitcher = ImageStitcher
+public typealias SeeUImageHarvester = ImageHarvester

@@ -11,6 +11,7 @@ Swift Package 使用 tools-version 6.2（源码使用类型级 nonisolated）、
 - SeeULongScreenshotStore：独立 actor 保存图片条带并导出 JPEG，不参与文字分析。
 - SeeUImageStitcher：不依赖 OCR 的通用纵向图片拼接，直接接收图片和可选几何区域。
 - FrameExclusionPolicy：宿主每帧传入不可变遮挡规则，默认不排除任何宿主 UI。
+- SeeUImageHarvester：按宿主请求的类别（头像、表情包、照片或自定义）从已识别帧中提取图片区域。
 
 ## 目录与职责
 
@@ -20,6 +21,7 @@ Sources/SeeU/
 ├── Recognition/                      # 单帧识别与文本处理
 │   ├── OCR/                          # Vision OCR、文字行、宿主排除策略
 │   ├── ChatLayout/                   # 聊天版式、气泡、布局锚点与识别证据
+│   ├── ImageRegions/                 # 图片区域协议、内置聊天图片检测、跨帧提取
 │   └── Text/                         # 文本规范化和相似度匹配
 ├── Conversation/                     # 会话状态、跨帧消息合并、上下文与 JSON
 ├── Stitching/                        # 通用图像对齐、拼接入口和条带合成
@@ -168,3 +170,31 @@ JSON、时间标记与图片预算。按项目规则未运行 Swift 编译或 XC
 `Scripts/verify_image_alignment.py` 是独立 Python 算法模型，用于不编译 iOS 时复核样本；
 需要运行环境已有 Pillow/numpy。它验证算法思路，不能替代 Swift 实现的 XCTest 或真机性能验证。
 还应在 Xcode 中检查聊天跨段合并、键盘开关、PiP 变化、会话切换和长图导出。
+
+## 图片区域提取（头像 / 表情包 / 照片）
+
+SeeU 只提供"从聊天帧里找出图片区域并裁出来"的通用能力；要哪些类别、结果怎么用由宿主决定。
+
+- `SeeUImageKind`：可扩展的类别标识，内置 `.avatar`、`.sticker`、`.photo`。
+- `SeeUImageRequest`：宿主声明要提取的类别、输出最长边与 JPEG 质量。
+- `SeeUImageDetector`：检测协议，输入 `SeeUImageFrame`（原像素、版式、页面底色），输出候选区域。
+  内置 `SeeUChatImageDetector`：先用 Vision 找两侧头像列，头像旁没有文字气泡的消息视为图片消息，
+  按尺寸分成表情包或照片。宿主可以注入自己的检测器识别别的类别。
+- `SeeUImageHarvester`（actor）：对 `LongScreenshotInput` 运行与请求相关的检测器，裁图、缩放、编码，
+  按外观跨帧去重得到稳定的 `imageID`，并用 `LongScreenshotInput.messageIDs` 把区域定位到
+  前一条 / 后一条 / 同行文字消息（`SeeUConversationItem.id`）。画面未变化时直接返回空结果。
+
+```swift
+let harvester = SeeUImageHarvester(request: SeeUImageRequest(kinds: [.avatar, .sticker]))
+// 与长图存档使用同一份 EngineOutput.longScreenshot
+let harvest = await harvester.harvest(input)
+for region in harvest.regions(of: .sticker) where region.isNewImage {
+    // region.jpegData / imageID / precedingMessageID / followingMessageID
+}
+let avatar = harvest.regions(of: .avatar)
+    .first { $0.side == .other && $0.evidenceCount >= 2 && !harvest.showsSenderNames }
+```
+
+`evidenceCount` 是同一张图出现在多少个不同消息位置；头像建议至少 2 处印证。群聊判断用
+`showsSenderNames`（气泡上方有昵称）。`LongScreenshotStore.renderRecent` 仍可取长图底部局部，
+供导出或自定义检测使用。检测依赖头像可见；无 OCR 文字的卡片（红包、转账）也可能被识别为图片消息。
