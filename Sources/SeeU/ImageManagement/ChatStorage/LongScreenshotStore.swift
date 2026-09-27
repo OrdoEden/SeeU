@@ -35,9 +35,11 @@ public actor LongScreenshotStore {
         for ladder in ladders.values { ladder.setCapacity(capacity) }
     }
 
-    public func ingest(_ input: LongScreenshotInput, merges: [LongScreenshotMerge] = []) {
-        guard input.epoch == epoch, input.parsed.capturedAt >= lastCapturedAt else { return }
-        if let sessionID, sessionID != input.sessionID { return }
+    /// 返回本帧是否加入了长图。已覆盖范围内的帧（没有新内容）不加入，只处理合段事件。
+    @discardableResult
+    public func ingest(_ input: LongScreenshotInput, merges: [LongScreenshotMerge] = []) -> Bool {
+        guard input.epoch == epoch, input.parsed.capturedAt >= lastCapturedAt else { return false }
+        if let sessionID, sessionID != input.sessionID { return false }
         sessionID = input.sessionID
         if conversationID != input.conversationID {
             ladders = [:]
@@ -72,11 +74,14 @@ public actor LongScreenshotStore {
         let footerRect = CGRect(x: 0, y: footerTop, width: bitmap.width, height: bitmap.height - footerTop)
         let footer: (jpeg: Data, height: Int)? = parsed.keyboardVisible || parsed.occluders.contains(where: { $0.intersects(footerRect) })
             ? nil : bitmap.pngStrip(y: footerTop, height: bitmap.height - footerTop).map { ($0, bitmap.height - footerTop) }
-        target.add(bitmap: bitmap, contentTop: parsed.contentTop, contentBottom: parsed.contentBottom,
-                   offset: placement.offset, bubbleRects: parsed.bubbles.map(\.rect),
-                   capturedAt: parsed.capturedAt, header: header, footer: footer, exclusions: parsed.occluders,
-                   seamRange: placement.matchingRange)
+        // 至少补上半行正文（或 24px）才算新内容；新段的第一帧总是加入。
+        let lineHeight = parsed.bodyLineHeight > 0 ? parsed.bodyLineHeight : 24
+        let added = target.add(bitmap: bitmap, contentTop: parsed.contentTop, contentBottom: parsed.contentBottom,
+                               offset: placement.offset, bubbleRects: parsed.bubbles.map(\.rect),
+                               capturedAt: parsed.capturedAt, header: header, footer: footer, exclusions: parsed.occluders,
+                               seamRange: placement.matchingRange, minimumNewHeight: max(24, 0.5 * lineHeight))
         ladders = ladders.filter { input.activeSegmentIDs.contains($0.key) }
+        return added
     }
 
     public func render(maxPixelHeight: Int) -> Data? {

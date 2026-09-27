@@ -41,11 +41,63 @@ nonisolated struct TranscriptEntry: Sendable {
         }.suffix(3))
     }
 
+    /// 当前采用的读法（variants 的键）。只有挑战者明显更多次出现才切换，避免两种读法来回跳。
+    var preferred: String? = nil
+
     var clipped: Bool { clippedTop || clippedBottom }
 
-    /// 多帧投票后的文字：出现次数最多的识别结果，避免单帧 OCR 抖动触发重新分析。
+    /// 多帧投票后的文字：采用的读法优先，其次出现次数最多的识别结果，避免单帧 OCR 抖动触发重新分析。
     var text: String {
-        variants.values.max { $0.count < $1.count }?.text ?? ""
+        if let preferred, let chosen = variants[preferred] { return chosen.text }
+        return variants.values.max { $0.count < $1.count }?.text ?? ""
+    }
+
+    /// 记录一次完整（未裁切）的读法并按滞回规则决定是否切换采用的文字。
+    mutating func observe(normalized key: String, text raw: String) {
+        var variant = variants[key] ?? (raw, 0)
+        variant.count += 1
+        // 同一规范化文字的多种原文里，不含“口合”类拆字的更可信，不被后来的拆字读法覆盖。
+        if !(TextMatch.hasSplitRadical(raw) && !TextMatch.hasSplitRadical(variant.text)) { variant.text = raw }
+        variants[key] = variant
+        if variants.count > 4,
+           let weakest = variants.filter({ $0.key != key && $0.key != preferred })
+               .min(by: { $0.value.count < $1.value.count })?.key {
+            variants.removeValue(forKey: weakest)
+        }
+        let current = preferred.flatMap { variants[$0]?.count } ?? 0
+        if preferred == nil || current == 0 {
+            preferred = variants.max { $0.value.count < $1.value.count }?.key
+        } else if let (leader, votes) = variants.max(by: { $0.value.count < $1.value.count }).map({ ($0.key, $0.value.count) }),
+                  leader != preferred, votes >= 2, Double(votes) > 1.5 * Double(current) {
+            preferred = leader
+        }
+        normalized = TextMatch.normalize(text)
+    }
+
+    /// 把同一位置被误拆成两条的记录并入本条：读法票数相加、来源合并。
+    mutating func absorb(_ other: TranscriptEntry) {
+        for (key, value) in other.variants {
+            var variant = variants[key] ?? (value.text, 0)
+            variant.count += value.count
+            if TextMatch.hasSplitRadical(variant.text) && !TextMatch.hasSplitRadical(value.text) { variant.text = value.text }
+            variants[key] = variant
+        }
+        observations += other.observations
+        textConfirmed = textConfirmed || other.textConfirmed
+        if other.sideConfidence > sideConfidence {
+            side = other.side
+            sideConfidence = other.sideConfidence
+        }
+        if (other.quote?.count ?? 0) > (quote?.count ?? 0) { quote = other.quote }
+        if senderName == nil { senderName = other.senderName }
+        firstSeen = min(firstSeen, other.firstSeen)
+        lastSeen = max(lastSeen, other.lastSeen)
+        mergeSources(other.sources)
+        if let leader = variants.max(by: { $0.value.count < $1.value.count }),
+           Double(leader.value.count) > 1.5 * Double(preferred.flatMap { variants[$0]?.count } ?? 0) {
+            preferred = leader.key
+        }
+        normalized = TextMatch.normalize(text)
     }
 }
 

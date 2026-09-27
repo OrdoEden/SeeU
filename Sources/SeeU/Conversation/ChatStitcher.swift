@@ -218,7 +218,8 @@ nonisolated final class ChatStitcher {
     var isViewingLiveTail: Bool {
         guard let last, let live = liveSegment, last.segmentID == live.id,
               let newest = live.entries.last else { return false }
-        return newest.bottom <= last.bottom + last.offset + 1 && newest.top >= last.top + last.offset - 1
+        // 最新一条只要还露在可见区内就算在看实时尾部：键盘弹起或最后一条被输入栏压住半截都很常见。
+        return newest.top < last.bottom + last.offset - 4 && newest.bottom > last.top + last.offset + 4
     }
 
     // MARK: - 偏移估计
@@ -412,6 +413,16 @@ nonisolated final class ChatStitcher {
                     return (i, max(similarity, prefix ? 0.7 : 0))
                 }
                 .max { $0.1 < $1.1 }
+                // 文字对不上时按槽位认：同一方向、同一位置、同样大小的气泡就是同一条消息，
+                // OCR 把“哈哈哈哈”读成别的字不能在原地多出一条。
+                ?? (bubble.kind == .message ? segment.entries.indices
+                    .filter { !matched.contains(segment.entries[$0].id) && segment.entries[$0].kind == .message }
+                    .filter { Self.sameSlot(segment.entries[$0], top: top, bottom: bottom,
+                                            minX: bubble.rect.minX, maxX: bubble.rect.maxX,
+                                            side: bubble.side, sideConfidence: bubble.sideConfidence,
+                                            clipped: bubble.clipped) }
+                    .min { abs(segment.entries[$0].top - top) < abs(segment.entries[$1].top - top) }
+                    .map { ($0, 0.0) } : nil)
 
             if let (i, _) = candidate {
                 var entry = segment.entries[i]
@@ -424,25 +435,19 @@ nonisolated final class ChatStitcher {
                 if !bubble.clipped && entry.clipped {
                     // 之前只看到一半，现在看到完整气泡：以完整版本为准。
                     entry.variants = [normalized: (bubble.text, 2)]
+                    entry.preferred = normalized
                     entry.normalized = normalized
                     entry.top = top; entry.bottom = bottom
                     entry.clippedTop = false; entry.clippedBottom = false
                 } else if !bubble.clipped {
-                    var variant = entry.variants[normalized] ?? (bubble.text, 0)
-                    variant.count += 1
-                    variant.text = bubble.text
-                    entry.variants[normalized] = variant
-                    if entry.variants.count > 4,
-                       let weakest = entry.variants.min(by: { $0.value.count < $1.value.count })?.key {
-                        entry.variants.removeValue(forKey: weakest)
-                    }
-                    entry.normalized = TextMatch.normalize(entry.text)
+                    entry.observe(normalized: normalized, text: bubble.text)
                     entry.top = entry.top * 0.7 + top * 0.3
                     entry.bottom = entry.bottom * 0.7 + bottom * 0.3
                 } else if entry.clipped {
                     // 两次都只看到一部分：保留更长的那次，完整的边以本帧为准。
                     if normalized.count > entry.normalized.count {
                         entry.variants = [normalized: (bubble.text, 1)]
+                        entry.preferred = normalized
                         entry.normalized = normalized
                     }
                     if !bubble.clippedTop { entry.top = top; entry.clippedTop = false }
@@ -481,12 +486,13 @@ nonisolated final class ChatStitcher {
             }
         }
 
-        // 应该在可见范围却没对上的条目：只见过一次、连续三帧都不在，视为误识别（例如画中画文字）删除。
+        // 应该在可见范围却没对上的条目：连续三帧都不在、且缺席次数不少于被看到的次数，
+        // 视为误识别（画中画文字、图片小字、一闪而过的错读）删除。真实消息被看到很多次，偶尔漏读不会被删。
         segment.entries = segment.entries.compactMap { entry in
             guard !matched.contains(entry.id), entry.top >= viewTop, entry.bottom <= viewBottom else { return entry }
             var missed = entry
             missed.misses += 1
-            if missed.observations <= 1 && missed.misses >= 3 { changed = true; return nil }
+            if missed.misses >= 3 && missed.misses >= missed.observations { changed = true; return nil }
             return missed
         }
         // 之前被误当成独立消息的引用块（父消息当时不在屏内）：现在已挂到父消息上，删掉那条。
@@ -501,6 +507,7 @@ nonisolated final class ChatStitcher {
             if segment.entries.count != before { changed = true }
         }
         segment.entries.sort { $0.top < $1.top }
+        if Self.collapseOverlapping(&segment.entries) { changed = true }
         // 条目上限：丢掉离当前画面最远的一端。
         while segment.entries.count > Self.maxEntriesPerSegment, let first = segment.entries.first, let lastEntry = segment.entries.last {
             if viewTop - first.top > lastEntry.bottom - viewBottom {
@@ -514,6 +521,57 @@ nonisolated final class ChatStitcher {
         segment.coveredTop = min(segment.coveredTop, viewTop)
         segment.coveredBottom = max(segment.coveredBottom, viewBottom)
         segments[index] = segment
+        return changed
+    }
+
+    /// 同一槽位：同一方向（或一方不确定）、纵向位置在一个气泡高度内、高度相近、横向大部分重合。
+    /// 被裁切的气泡高度不可比，只看顶边或底边位置。
+    static func sameSlot(
+        _ entry: TranscriptEntry, top: CGFloat, bottom: CGFloat, minX: CGFloat, maxX: CGFloat,
+        side: BubbleSide, sideConfidence: Double, clipped: Bool
+    ) -> Bool {
+        if side != .unknown, entry.side != .unknown, side != entry.side,
+           sideConfidence >= 0.75, entry.sideConfidence >= 0.75 { return false }
+        let height = bottom - top, entryHeight = entry.bottom - entry.top
+        guard height > 0, entryHeight > 0 else { return false }
+        let tolerance = max(10, 0.5 * min(height, entryHeight))
+        if clipped || entry.clipped {
+            guard abs(entry.top - top) < tolerance || abs(entry.bottom - bottom) < tolerance else { return false }
+        } else {
+            guard abs(entry.top - top) < tolerance,
+                  max(height, entryHeight) / min(height, entryHeight) <= 1.45 else { return false }
+        }
+        let overlap = min(entry.maxX, maxX) - max(entry.minX, minX)
+        return overlap >= 0.6 * min(entry.maxX - entry.minX, maxX - minX)
+    }
+
+    /// 同一位置被拆成两条的记录（历史遗留或合段带来）并成一条，保留观察更多的那条的身份。
+    /// 相邻的两条真实消息之间有间距，纵向不会大面积重叠。
+    static func collapseOverlapping(_ entries: inout [TranscriptEntry]) -> Bool {
+        var changed = false
+        var i = 0
+        while i < entries.count {
+            var j = i + 1
+            while j < entries.count, entries[j].top < entries[i].bottom {
+                let a = entries[i], b = entries[j]
+                let vertical = min(a.bottom, b.bottom) - max(a.top, b.top)
+                let horizontal = min(a.maxX, b.maxX) - max(a.minX, b.minX)
+                if a.kind == b.kind, a.kind != .gap,
+                   vertical > 0.5 * min(a.bottom - a.top, b.bottom - b.top),
+                   horizontal > 0.5 * min(a.maxX - a.minX, b.maxX - b.minX),
+                   !(a.side != .unknown && b.side != .unknown && a.side != b.side
+                     && a.sideConfidence >= 0.75 && b.sideConfidence >= 0.75) {
+                    var keep = a.observations >= b.observations ? a : b
+                    keep.absorb(a.observations >= b.observations ? b : a)
+                    entries[i] = keep
+                    entries.remove(at: j)
+                    changed = true
+                    continue
+                }
+                j += 1
+            }
+            i += 1
+        }
         return changed
     }
 
@@ -544,7 +602,10 @@ nonisolated final class ChatStitcher {
                 let duplicate = targetSegment.entries.firstIndex { existing in
                     existing.kind == entry.kind
                         && abs(existing.top - top) < max(14, 0.9 * (bottom - top))
-                        && TextMatch.similarity(existing.normalized, entry.normalized) >= 0.6
+                        && (TextMatch.similarity(existing.normalized, entry.normalized) >= 0.6
+                            || (entry.kind == .message && Self.sameSlot(
+                                existing, top: top, bottom: bottom, minX: entry.minX, maxX: entry.maxX,
+                                side: entry.side, sideConfidence: entry.sideConfidence, clipped: entry.clipped)))
                 }
                 if let duplicate {
                     targetSegment.entries[duplicate].mergeSources(entry.sources)

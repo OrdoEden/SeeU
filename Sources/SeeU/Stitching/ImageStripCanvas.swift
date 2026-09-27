@@ -73,6 +73,19 @@ nonisolated final class ImageStripCanvas {
         return true
     }
 
+    /// 这张图放进来后能补上的最大连续高度：去掉排除区，再去掉已有来源的有效像素。
+    /// 只计算宽度超过画布一半的空缺，窄条（气泡边缘、头像旁的缝）不算新内容。
+    func uncoveredHeight(rect: CGRect, offset: CGFloat, exclusions: [CGRect] = []) -> CGFloat {
+        guard Self.safeCoordinate(offset), Self.safeRect(rect) else { return 0 }
+        let shift = offset.rounded()
+        let bounds = rect.integral.intersection(CGRect(x: 0, y: rect.minY, width: CGFloat(width), height: rect.height))
+            .offsetBy(dx: 0, dy: shift)
+        guard !bounds.isNull, !bounds.isEmpty else { return 0 }
+        let masks = exclusions.filter(Self.safeRect).map { $0.integral.offsetBy(dx: 0, dy: shift) }
+        let open = Self.subtract(Self.subtract([bounds], masks), strips.flatMap(\.valid))
+        return open.filter { $0.width >= 0.5 * CGFloat(width) }.map(\.height).max() ?? 0
+    }
+
     func absorb(_ other: ImageStripCanvas, shift: CGFloat) {
         guard other !== self, other.width == width, Self.safeCoordinate(shift),
               other.strips.allSatisfy({ Self.safeRect($0.bounds.offsetBy(dx: 0, dy: shift.rounded())) }) else { return }

@@ -22,18 +22,27 @@ nonisolated final class ChatLadder {
     var span: Int { canvas.span }
     var rungCount: Int { canvas.count }
 
+    /// 返回是否真的加入了条带。没有带来新内容的帧（键盘弹出把列表上推、原地静止、OCR 抖动）
+    /// 一律不加：它们只会挤掉更早的条带，还可能把输入栏或键盘边缘拼进长图中间。
+    @discardableResult
     func add(
         bitmap: FrameBitmap, contentTop: CGFloat, contentBottom: CGFloat, offset: CGFloat,
         bubbleRects: [CGRect], capturedAt: Date, header: (jpeg: Data, height: Int)?,
-        footer: (jpeg: Data, height: Int)?, exclusions: [CGRect] = [], seamRange: ClosedRange<CGFloat>? = nil
-    ) {
+        footer: (jpeg: Data, height: Int)?, exclusions: [CGRect] = [], seamRange: ClosedRange<CGFloat>? = nil,
+        minimumNewHeight: CGFloat = 0
+    ) -> Bool {
         let pad = max(12, 0.035 * CGFloat(width))
+        let rect = CGRect(x: 0, y: contentTop, width: CGFloat(width), height: contentBottom - contentTop)
+        if canvas.count > 0,
+           canvas.uncoveredHeight(rect: rect, offset: offset, exclusions: exclusions) < max(1, minimumNewHeight) {
+            return false
+        }
         guard contentBottom - contentTop > 40,
               canvas.add(bitmap: bitmap,
                          rect: CGRect(x: 0, y: contentTop, width: CGFloat(width), height: contentBottom - contentTop),
                          offset: offset, exclusions: exclusions,
                          protectedRects: bubbleRects.map { $0.insetBy(dx: 0, dy: -pad) },
-                         capturedAt: capturedAt, seamRange: seamRange) else { return }
+                         capturedAt: capturedAt, seamRange: seamRange) else { return false }
         if let header, self.header == nil || capturedAt >= self.header!.capturedAt {
             self.header = (header.jpeg, capturedAt)
         }
@@ -43,6 +52,7 @@ nonisolated final class ChatLadder {
             self.footer = (footer?.jpeg, frameBottom, capturedAt)
         }
         canvas.trim(to: capacity)
+        return true
     }
 
     func absorb(_ other: ChatLadder, shift: CGFloat) {

@@ -86,11 +86,16 @@ nonisolated struct ChatLayoutParser {
             bottomDetected = true
         }
         if let keyboardTop {
-            // 键盘上方还有输入栏（微信约 50pt，扣掉气泡与输入栏的间距后 ≈ 0.045H）和系统键盘的候选栏。
-            // 宿主 标记已位于候选栏上方，只需再让出输入栏高度。
-            let fromExclusion = excludedKeyboardTop.map { abs($0 - keyboardTop) < 1 } ?? false
-            let margin: CGFloat = fromExclusion ? 0.045 : (bottomDetected ? 0.06 : 0.12)
-            contentBottom = min(contentBottom, keyboardTop - margin * H)
+            // 键盘上方还有输入栏。优先从键盘顶部向上找输入栏自身的纯色带；
+            // 找不到时按保守高度让出（微信输入栏 + 间距约 0.09H），宁可裁掉半条消息也不能把输入栏拼进长图。
+            if let bar = Self.detectInputBarTop(bitmap, above: keyboardTop) {
+                contentBottom = min(contentBottom, bar)
+                bottomDetected = true
+            } else {
+                let fromExclusion = excludedKeyboardTop.map { abs($0 - keyboardTop) < 1 } ?? false
+                let margin: CGFloat = fromExclusion ? 0.1 : (bottomDetected ? 0.06 : 0.12)
+                contentBottom = min(contentBottom, keyboardTop - margin * H)
+            }
         }
         guard contentBottom > contentTop + 0.2 * H else {
             return result(score: 0, title: title, top: contentTop, bottom: contentBottom, bubbles: [],
@@ -185,7 +190,10 @@ nonisolated struct ChatLayoutParser {
         var bubbles: [ChatBubble] = timeBubbles
         for (index, group) in groups.enumerated() where !skip.contains(index) {
             let rect = group.dropFirst().reduce(group[0].rect) { $0.union($1.rect) }
-            let text = Self.cleanBubbleText(Self.join(group.map(\.text)))
+            // 宽度证据修复“口合”类拆字，按行处理：多行气泡每行宽度不同。
+            let text = Self.cleanBubbleText(Self.join(group.map {
+                TextMatch.repairSplitRadicals($0.text, width: $0.rect.width, height: $0.rect.height)
+            }))
             guard !text.isEmpty else { continue }
             // 聊天正文的字号是固定的一档：每个字约占 0.6 个行高。字数远超这个密度，说明是
             // 图片、截图里的小字被当成一行识别出来了（像素对齐的少量噪声会让它们偶尔整段露出来）。
@@ -308,6 +316,50 @@ nonisolated struct ChatLayoutParser {
     /// 输入栏顶部：沿屏幕两侧 2–7 像素的窄边，从底部附近取输入栏自身颜色，向上走到颜色变化处。
     /// 窄边避开了头像和输入栏按钮；输入栏是纯色带，而上方是页面背景或照片壁纸。
     static func detectInputBarTop(_ bitmap: FrameBitmap) -> CGFloat? {
+        let h = Double(bitmap.height)
+        return scanBandTop(bitmap, from: Int(h * 0.955), stop: Int(h * 0.6))
+    }
+
+    /// 键盘弹出时的输入栏顶部：从键盘顶部向上，沿两侧窄边逐段找颜色边界。
+    /// 键盘与输入栏底色往往只差几个色阶（实测 244 vs 246），输入栏与聊天背景差得多（246 vs 237）；
+    /// 所以取第一条“下方色带足够高（≥ 一个输入框，0.035H）”的边界，键盘顶部的薄边和分隔线被跳过。
+    static func detectInputBarTop(_ bitmap: FrameBitmap, above keyboardTop: CGFloat) -> CGFloat? {
+        let h = Double(bitmap.height), w = bitmap.width
+        let start = Int(Double(keyboardTop) - 0.008 * h)
+        let stop = max(Int(Double(keyboardTop) - 0.22 * h), Int(0.25 * h))
+        guard start > stop, start < bitmap.height else { return nil }
+        func edge(_ y: Int) -> RGB? {
+            bitmap.medianColor(at: [
+                CGPoint(x: 3, y: y), CGPoint(x: 6, y: y),
+                CGPoint(x: w - 4, y: y), CGPoint(x: w - 7, y: y)
+            ])
+        }
+        guard var reference = edge(start) else { return nil }
+        var bandBottom = start
+        var mismatch = 0
+        var y = start
+        while y > stop {
+            guard let sample = edge(y) else { y -= 2; continue }
+            if sample.distance(to: reference) > 8 {
+                mismatch += 1
+                if mismatch >= 5 {
+                    let boundary = y + 5 * 2
+                    if Double(bandBottom - boundary) >= 0.035 * h { return CGFloat(boundary) }
+                    // 太薄的色带（键盘边框、分隔线）：换成新颜色继续向上找。
+                    reference = sample
+                    bandBottom = boundary
+                    mismatch = 0
+                }
+            } else {
+                mismatch = 0
+            }
+            y -= 2
+        }
+        return nil
+    }
+
+    /// 沿屏幕两侧窄边从 `from` 向上走，颜色连续变化处即色带顶部。
+    private static func scanBandTop(_ bitmap: FrameBitmap, from start: Int, stop: Int) -> CGFloat? {
         let w = bitmap.width
         func edge(_ y: Int) -> RGB? {
             bitmap.medianColor(at: [
@@ -315,10 +367,9 @@ nonisolated struct ChatLayoutParser {
                 CGPoint(x: w - 4, y: y), CGPoint(x: w - 7, y: y)
             ])
         }
-        guard let bar = edge(Int(Double(bitmap.height) * 0.955)) else { return nil }
+        guard start < bitmap.height, start > 0, let bar = edge(start) else { return nil }
         var mismatch = 0
-        var y = Int(Double(bitmap.height) * 0.955)
-        let stop = Int(Double(bitmap.height) * 0.6)
+        var y = start
         while y > stop {
             if let sample = edge(y), sample.distance(to: bar) > 14 {
                 mismatch += 1

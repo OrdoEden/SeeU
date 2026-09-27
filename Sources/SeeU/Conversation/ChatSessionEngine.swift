@@ -126,12 +126,23 @@ public actor ChatSessionEngine {
         let previousMessages = currentMessages
         currentMessages = parsed.messageBubbles.enumerated().map { index, bubble in
             let normalized = TextMatch.normalize(bubble.text)
-            let entry = stitcher.currentSegment?.entries.filter {
+            let shift = placement?.offset ?? 0
+            let candidates = stitcher.currentSegment?.entries.filter {
                 $0.kind == .message && !usedEntryIDs.contains($0.id)
-                    && ($0.side == bubble.side || $0.side == .unknown || bubble.side == .unknown)
-                    && abs($0.top - bubble.rect.minY - (placement?.offset ?? 0)) < max(14, bubble.rect.height)
+            } ?? []
+            let byText = candidates.filter {
+                ($0.side == bubble.side || $0.side == .unknown || bubble.side == .unknown)
+                    && abs($0.top - bubble.rect.minY - shift) < max(14, bubble.rect.height)
                     && TextMatch.similarity($0.normalized, normalized) >= 0.7
-            }.min { abs($0.top - bubble.rect.minY - (placement?.offset ?? 0)) < abs($1.top - bubble.rect.minY - (placement?.offset ?? 0)) }
+            }
+            // 文字没对上时按槽位认回历史条目，否则 OCR 抖动会让当前屏看起来“接不上”历史。
+            let bySlot = placement == nil ? [] : candidates.filter {
+                ChatStitcher.sameSlot($0, top: bubble.rect.minY + shift, bottom: bubble.rect.maxY + shift,
+                                      minX: bubble.rect.minX, maxX: bubble.rect.maxX, side: bubble.side,
+                                      sideConfidence: bubble.sideConfidence, clipped: bubble.clipped)
+            }
+            let entry = (byText.isEmpty ? bySlot : byText)
+                .min { abs($0.top - bubble.rect.minY - shift) < abs($1.top - bubble.rect.minY - shift) }
             let prior = previousMessages.enumerated().filter {
                 !usedIDs.contains($0.element.id) && $0.element.side == bubble.side
                     && TextMatch.similarity(TextMatch.normalize($0.element.text), normalized) >= 0.7
@@ -149,7 +160,8 @@ public actor ChatSessionEngine {
             }
             return LiveMessage(id: id, kind: .message,
                         side: bubble.side, sideConfidence: bubble.sideConfidence,
-                        text: bubble.text, senderName: bubble.senderName, quote: bubble.quote,
+                        text: entry.map { $0.clipped && !bubble.clipped ? bubble.text : $0.text } ?? bubble.text,
+                        senderName: bubble.senderName, quote: bubble.quote,
                         observations: entry?.observations ?? ((prior?.observations ?? 0) + 1), clipped: bubble.clipped,
                         sources: [SeeUObservation(frame: parsed, bubble: bubble)])
         }
