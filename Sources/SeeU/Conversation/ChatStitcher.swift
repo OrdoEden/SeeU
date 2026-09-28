@@ -26,6 +26,8 @@ nonisolated final class ChatStitcher {
     private(set) var currentSegmentID: UUID?
     /// 段链：链首含最新消息，依次更早。只有链上的段会带来分析上下文。
     private(set) var chain: [UUID] = []
+    /// 其它会话暂存的段：不在当前链上，但不是垃圾。见 `switchChain`。
+    private var parked: Set<UUID> = []
     private var last: Last?
     private var lastCaptureAt = Date.distantPast
     /// 最近一次 offset 估计中有多少条不同消息被文字印证。
@@ -53,8 +55,26 @@ nonisolated final class ChatStitcher {
     func reset() {
         segments = []
         chain = []
+        parked = []
         currentSegmentID = nil
         last = nil
+    }
+
+    /// 切会话：换成那个会话自己的链。调用方先读 `chain` 保存旧会话的链。
+    ///
+    /// 链首代表"含最新消息的段"，每个会话各有一条。共用一条链时，切到 B 会把 A 的链首
+    /// 挤掉，切回 A 后 `isViewingLiveTail` 为 false，上层闸门误报"正在查看历史"。
+    /// 片段本身仍共存，只有链和上一帧参考随会话切换。
+    ///
+    /// - Parameter parked: 其它会话暂存的段。它们不参与本会话的段数上限和淘汰。
+    func switchChain(to incoming: [UUID], parked: Set<UUID>) {
+        self.parked = parked
+        chain = incoming.filter { id in segments.contains { $0.id == id } }
+        currentSegmentID = chain.first
+        // 上一帧属于另一个会话的画面，不能再做像素对齐参考。
+        last = nil
+        lastCaptureAt = .distantPast
+        refreshLiveFlags()
     }
 
     /// 只保留这些片段，其余丢掉。用于会话身份被淘汰后回收它留下的片段——
@@ -63,6 +83,7 @@ nonisolated final class ChatStitcher {
         guard segments.contains(where: { !keeping.contains($0.id) }) else { return }
         segments.removeAll { !keeping.contains($0.id) }
         chain.removeAll { !keeping.contains($0) }
+        parked.formIntersection(keeping)
         if let currentSegmentID, !keeping.contains(currentSegmentID) {
             self.currentSegmentID = chain.first ?? segments.last?.id
         }
@@ -87,11 +108,17 @@ nonisolated final class ChatStitcher {
         lastCaptureAt = .distantPast
     }
 
-    func ingest(_ frame: ParsedChatFrame, bitmap: FrameBitmap) -> StitchPlacement? {
+    /// - Parameter belongsToFrame: 判断某个片段是否属于这一帧的会话。片段现在跨会话保留
+    ///   （切走再切回来不用重新攒），所以认回旧段时必须确认是同一个会话，
+    ///   否则别的聊天页会被拼进当前会话。
+    func ingest(_ frame: ParsedChatFrame, bitmap: FrameBitmap,
+                belongsToFrame: ((UUID) -> Bool)? = nil) -> StitchPlacement? {
         let region = ImageStitchRegion(
             rect: CGRect(x: 0, y: frame.contentTop, width: CGFloat(bitmap.width),
                          height: frame.contentBottom - frame.contentTop), exclusions: frame.occluders
         )
+        /// 这段能不能被这一帧认领。没有归属信息时（单测、旧调用方）一律允许。
+        func claimable(_ id: UUID) -> Bool { belongsToFrame?(id) ?? true }
         let previous = last
         // 和上一帧差不多是连续的（同一会话、间隔很短）。
         let continuous = previous.map {
@@ -114,7 +141,7 @@ nonisolated final class ChatStitcher {
                                         hint: continuous ? previous.scrollDelta : nil)
         }
         let motionShift: CGFloat? = visual.flatMap { $0.status == .unmatched ? nil : $0.offset }
-        if let previous, let shift = motionShift,
+        if let previous, let shift = motionShift, claimable(previous.segmentID),
            let index = segments.firstIndex(where: { $0.id == previous.segmentID }) {
             target = previous.segmentID
             offset = previous.offset + shift
@@ -126,7 +153,8 @@ nonisolated final class ChatStitcher {
                 lastPlacementFromText = true
                 usedMotion = false
             }
-        } else if let previous, continuous, let index = segments.firstIndex(where: { $0.id == previous.segmentID }),
+        } else if let previous, continuous, claimable(previous.segmentID),
+                  let index = segments.firstIndex(where: { $0.id == previous.segmentID }),
            !frame.messageBubbles.isEmpty,
            var found = estimateOffset(frame.bubbles, into: segments[index], hint: previous.offset,
                                       occluders: frame.occluders) {
@@ -137,7 +165,7 @@ nonisolated final class ChatStitcher {
         }
         if target == nil, !frame.messageBubbles.isEmpty,
            let (index, found) = bestOtherSegment(frame.bubbles, excluding: continuous ? currentSegmentID : nil,
-                                                occluders: frame.occluders) {
+                                                occluders: frame.occluders, claimable: claimable) {
             kind = .rejoined
             target = segments[index].id
             offset = found
@@ -169,7 +197,8 @@ nonisolated final class ChatStitcher {
                     top: frame.contentTop, bottom: frame.contentBottom, scrollDelta: scrollDelta ?? 0)
 
         let merged = absorbOverlappingSegments(
-            into: target, viewTop: frame.contentTop + offset, viewBottom: frame.contentBottom + offset
+            into: target, viewTop: frame.contentTop + offset, viewBottom: frame.contentBottom + offset,
+            claimable: claimable
         )
         return StitchPlacement(
             kind: kind, segmentID: target, chainIndex: chain.firstIndex(of: target) ?? chain.count,
@@ -184,9 +213,11 @@ nonisolated final class ChatStitcher {
     ) -> StitchPlacement? {
         let segment = TranscriptSegment(id: UUID(), isLive: false, createdAt: frame.capturedAt)
         segments.append(segment)
-        if segments.count > Self.maxSegments {
+        // `maxSegments` 只约束当前会话自己的段。别的会话暂存的段（`parked`）不算、也不丢，
+        // 由引擎按"最近用过的会话"回收——否则切走的会话的段会被当成孤立段先清掉。
+        if segments.filter({ !parked.contains($0.id) }).count > Self.maxSegments {
             // 优先丢掉没接进链的段；都接上了就丢链尾（最早的一段）。
-            let unlinked = segments.first { !chain.contains($0.id) && $0.id != segment.id }
+            let unlinked = segments.first { !chain.contains($0.id) && !parked.contains($0.id) && $0.id != segment.id }
             if let unlinked {
                 segments.removeAll { $0.id == unlinked.id }
             } else if chain.count > 1 {
@@ -386,9 +417,11 @@ nonisolated final class ChatStitcher {
     }
 
     private func bestOtherSegment(
-        _ bubbles: [ChatBubble], excluding: UUID?, occluders: [CGRect] = []
+        _ bubbles: [ChatBubble], excluding: UUID?, occluders: [CGRect] = [],
+        claimable: (UUID) -> Bool = { _ in true }
     ) -> (Int, CGFloat)? {
-        for (index, segment) in segments.enumerated().reversed() where segment.id != excluding {
+        for (index, segment) in segments.enumerated().reversed()
+        where segment.id != excluding && claimable(segment.id) {
             if let offset = estimateOffset(bubbles, into: segment, hint: nil, occluders: occluders) {
                 return (index, offset)
             }
@@ -593,8 +626,11 @@ nonisolated final class ChatStitcher {
     }
 
     /// 当前段和其他段有可靠重叠时合并（用户翻回之前看过的位置）。
+    ///
+    /// 只在同一会话内合并：跨会话合并会把两个聊天的记录永久混在一起，无法再拆开。
     private func absorbOverlappingSegments(
-        into target: UUID, viewTop: CGFloat, viewBottom: CGFloat
+        into target: UUID, viewTop: CGFloat, viewBottom: CGFloat,
+        claimable: (UUID) -> Bool = { _ in true }
     ) -> [(id: UUID, shift: CGFloat)] {
         var merged: [(id: UUID, shift: CGFloat)] = []
         guard segments.count > 1, let targetIndex = segments.firstIndex(where: { $0.id == target }) else { return merged }
@@ -609,7 +645,7 @@ nonisolated final class ChatStitcher {
                 senderName: nil, quote: nil, color: nil
             )
         }
-        for other in segments where other.id != target {
+        for other in segments where other.id != target && claimable(other.id) {
             // other 的坐标 + (-offset) = target 坐标
             guard let offset = estimateOffset(probe, into: other, hint: nil) else { continue }
             let shift = -offset

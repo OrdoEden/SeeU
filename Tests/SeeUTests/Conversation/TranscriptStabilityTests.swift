@@ -133,6 +133,29 @@ final class TranscriptStabilityTests: XCTestCase {
         XCTAssertTrue(twice.textConfirmed, "同槽位第二次观察应确认")
     }
 
+    // MARK: - 会话归属
+
+    /// 片段跨会话保留后，别的会话的画面不能认回（rejoin）或合并（absorb）进这些段。
+    /// 常见触发：两个群里有人发了同一句话；或者误判为聊天页的其它 App 画面恰好有相同文字。
+    func testFrameCannotRejoinSegmentOwnedByAnotherConversation() throws {
+        let stitcher = ChatStitcher()
+        let image = try bitmap()
+        let bubbles = stableBubbles("我大概七点半到公司楼下")
+        let a = try XCTUnwrap(stitcher.ingest(frame(bubbles, at: 0), bitmap: image))
+        // 切到别的会话，A 的段停到一边。
+        stitcher.switchChain(to: [], parked: [a.segmentID])
+        // 同样的文字出现在另一个会话里：不许认回 A 的段，只能另起一段。
+        let other = try XCTUnwrap(stitcher.ingest(frame(bubbles, at: 10), bitmap: image) { $0 != a.segmentID })
+        XCTAssertEqual(other.kind, .newSegment)
+        XCTAssertNotEqual(other.segmentID, a.segmentID)
+        XCTAssertEqual(stitcher.segments.count, 2, "A 的段必须原样保留，不能被合并")
+        // 切回 A：换回 A 的链，同样的画面应认回 A 的段，而不是再开一段。
+        stitcher.switchChain(to: [a.segmentID], parked: [other.segmentID])
+        let back = try XCTUnwrap(stitcher.ingest(frame(bubbles, at: 20), bitmap: image) { $0 != other.segmentID })
+        XCTAssertEqual(back.segmentID, a.segmentID)
+        XCTAssertEqual(stitcher.chain.first, a.segmentID, "切回 A 后 A 的段是链首，才算在看最新消息")
+    }
+
     // MARK: - 片段链
 
     /// 纹理必须整帧唯一，否则对齐会在错误偏移上匹配成功。
