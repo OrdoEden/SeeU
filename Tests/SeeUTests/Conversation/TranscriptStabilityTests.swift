@@ -26,10 +26,11 @@ final class TranscriptStabilityTests: XCTestCase {
         return try FrameBitmap(image: image)
     }
 
-    private func bubble(_ text: String, y: CGFloat, side: BubbleSide, width: CGFloat = 200) -> ChatBubble {
+    private func bubble(_ text: String, y: CGFloat, side: BubbleSide, width: CGFloat = 200,
+                        clippedBottom: Bool = false) -> ChatBubble {
         let x: CGFloat = side == .me ? 390 - 70 - width : 70
         return ChatBubble(kind: .message, text: text, rect: CGRect(x: x, y: y, width: width, height: 40),
-                          side: side, sideConfidence: 0.95, clippedTop: false, clippedBottom: false,
+                          side: side, sideConfidence: 0.95, clippedTop: false, clippedBottom: clippedBottom,
                           senderName: nil, quote: nil, color: nil)
     }
 
@@ -112,6 +113,55 @@ final class TranscriptStabilityTests: XCTestCase {
         }
         XCTAssertFalse(try XCTUnwrap(stitcher.currentSegment).entries.contains { $0.text == "画中画残留文字" })
         XCTAssertEqual(try XCTUnwrap(stitcher.currentSegment).entries.count, 3)
+    }
+
+    /// 贴着输入栏的最后一条拿不到文字佐证，此前会一直卡在"未确认"，上下文塌缩成当前一屏。
+    /// 同一槽位再看到一次就该确认。
+    func testClippedTailIsConfirmedOnSecondObservation() throws {
+        let stitcher = ChatStitcher()
+        let image = try bitmap()
+        let bubbles = stableBubbles("我大概七点半到公司楼下")
+            + [bubble("路上有点堵，可能晚十分钟", y: 440, side: .other, clippedBottom: true)]
+        _ = stitcher.ingest(frame(bubbles, at: 0), bitmap: image)
+        let once = try XCTUnwrap(try XCTUnwrap(stitcher.currentSegment).entries.last)
+        XCTAssertEqual(once.text, "路上有点堵，可能晚十分钟")
+        XCTAssertTrue(once.clippedBottom)
+        XCTAssertFalse(once.textConfirmed, "只看到一次还不算确认")
+
+        _ = stitcher.ingest(frame(bubbles, at: 0.5), bitmap: image)
+        let twice = try XCTUnwrap(try XCTUnwrap(stitcher.currentSegment).entries.last)
+        XCTAssertTrue(twice.textConfirmed, "同槽位第二次观察应确认")
+    }
+
+    // MARK: - 片段链
+
+    /// 纹理必须整帧唯一，否则对齐会在错误偏移上匹配成功。
+    /// 这里没有针对"另起一段并继承方向"的用例：那个分支只由丢帧触发，合成帧造不出来，
+    /// 交给真实录屏的 `ReplayTests`。这个辅助函数留给需要真实位移的用例。
+    private func scrolledBitmap(_ scroll: Int) throws -> FrameBitmap {
+        let width = 390, height = 844
+        var bytes = [UInt8](repeating: 240, count: width * height * 4)
+        // 整帧唯一的高频纹理：背景是均匀噪声，错位匹配会得到很大的误差，不会假成功。
+        // 用 &* 和截断，避免 y - scroll 为负时溢出。
+        func texture(_ x: Int, _ y: Int) -> UInt8 {
+            let value = UInt64(bitPattern: Int64(x) &* 73_856_093) ^ UInt64(bitPattern: Int64(y) &* 19_349_663)
+            return UInt8(truncatingIfNeeded: value ^ (value >> 13) ^ (value >> 23))
+        }
+        for y in 0..<height {
+            for x in 0..<width {
+                let index = (y * width + x) * 4
+                let value = texture(x, y - scroll)
+                bytes[index] = value; bytes[index + 1] = value; bytes[index + 2] = value
+            }
+        }
+        let provider = try XCTUnwrap(CGDataProvider(data: Data(bytes) as CFData))
+        let image = try XCTUnwrap(CGImage(width: width, height: height, bitsPerComponent: 8,
+                                          bitsPerPixel: 32, bytesPerRow: width * 4,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                                          provider: provider, decode: nil, shouldInterpolate: false,
+                                          intent: .defaultIntent))
+        return try FrameBitmap(image: image)
     }
 
     func testOverlappingDuplicatesCollapseIntoTheBetterObservedEntry() {

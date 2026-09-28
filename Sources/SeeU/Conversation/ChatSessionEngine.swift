@@ -29,6 +29,14 @@ public actor ChatSessionEngine {
 
     private var conversationID: UUID?
     private var conversationTitle: String?
+    /// 规范化标题 → 会话 id。切走再切回来时沿用同一个 id。
+    private var conversationIdentities: [String: UUID] = [:]
+    /// 上面字典的访问顺序，用来淘汰久未使用的会话。
+    private var conversationIdentityOrder: [String] = []
+    /// 片段 → 所属会话。段不随会话切换清掉，所以要记住它归谁。
+    private var segmentOwner: [UUID: UUID] = [:]
+    /// 最多记住多少个会话的身份。
+    static let rememberedConversations = 8
     private var confirmed = false
     private var pendingTitle: (title: String, count: Int)?
     private var revision = 0
@@ -90,7 +98,6 @@ public actor ChatSessionEngine {
         }
         nonChatStreak = 0
         chatStreak += 1
-        let reentering = !inChat && interrupted
         inChat = true
 
         // 会话身份：标题稳定变化两帧才切换，防止单帧 OCR 误读把整段记录清掉。
@@ -99,20 +106,21 @@ public actor ChatSessionEngine {
             startConversation(title: title)
         } else if let title, let current = conversationTitle,
                   TextMatch.similarity(TextMatch.normalize(title), TextMatch.normalize(current)) < 0.6 {
-            if let pending = pendingTitle, TextMatch.normalize(pending.title) == TextMatch.normalize(title) {
-                pendingTitle = (title, pending.count + 1)
+            // 标题相同时累加。用相似度而不是全等：OCR 可能把同一个标题读成两种写法，
+            // 全等会让计数每帧归零，会话永远切不过去。
+            if let pending = pendingTitle,
+               TextMatch.similarity(TextMatch.normalize(pending.title), TextMatch.normalize(title)) >= 0.75 {
+                pendingTitle = (pending.count >= 2 ? pending.title : title, pending.count + 1)
             } else {
                 pendingTitle = (title, 1)
             }
-            guard (pendingTitle?.count ?? 0) >= 2 || parsed.hasReliableSingleFrameEvidence else {
-                currentMessages = []
-                return EngineOutput(update: makeUpdate(frameID: frameID, detection: .waiting, placement: nil, skipped: false, ocrMs: ocrMs), longScreenshot: nil)
-            }
-            startConversation(title: title)
-        } else if reentering && title == nil {
-            // 回到聊天页但看不清标题，无法确认还是同一个人：保守地当新会话。
-            startConversation(title: nil)
+            // 标题变了但要连续两帧才确认。确认不够时**照常按原会话拼接**：直接丢弃这一帧
+            // 会让画面抖动/键盘弹起时的文字白丢，返回 .waiting 还会让上层清空上下文。
+            // 内容接不上时拼接器自己会另起孤立片段，不会污染原会话。
+            if (pendingTitle?.count ?? 0) >= 2 { startConversation(title: title) }
         } else {
+            // 回到聊天页但标题没读出来：沿用原来的会话。像素对齐不能拿上一帧当参考，
+            // 内容接不上时只会另起孤立片段，等标题读出来再按上面的两帧规则切换。
             pendingTitle = nil
             if conversationTitle == nil, let title { conversationTitle = title }
         }
@@ -120,6 +128,14 @@ public actor ChatSessionEngine {
         interrupted = false
 
         let placement = stitcher.ingest(parsed, bitmap: bitmap)
+        // 记住这一段归谁：片段不随会话切换清掉，`rejoin` 时要能认出来。
+        if let placement, let conversationID { segmentOwner[placement.segmentID] = conversationID }
+        // 会话身份被淘汰后，它留下的片段不会再有人回来认领，回收掉。
+        if segmentOwner.values.contains(where: { !conversationIdentities.values.contains($0) }) {
+            segmentOwner = segmentOwner.filter { conversationIdentities.values.contains($0.value) }
+            // 当前这一帧的段归属刚记上，一定在保留集合里。
+            stitcher.keepSegments(Set(segmentOwner.keys))
+        }
         var usedIDs = Set<UUID>()
         var usedEntryIDs = Set<UUID>()
         var matchedHistoryIDs = Set<UUID>()
@@ -219,14 +235,52 @@ public actor ChatSessionEngine {
     }
 
     private func startConversation(title: String?) {
-        resetConversation()
-        conversationID = UUID()
+        // 切会话**不重置拼接器**：片段保留，切回来时画面文字能接上自己的旧段（rejoin），
+        // 历史不用重新攒。每个会话各自一段，`maxSegments` 够放几份。
+        currentMessages = []
+        currentHistoryIDs = []
+        currentFrameItems = []
+        anchors = LayoutAnchors()
+        conversationID = identity(for: title)
         conversationTitle = title
-        chatStreak = 1
+        confirmed = false
+        pendingTitle = nil
+        interrupted = false
+        contentHash = 0
+        revision += 1
+    }
+
+    /// 会话身份按标题稳定映射。同一个标题永远得到同一个 `conversationID`，
+    /// A→B→A 切回来还是原来的 id，上层的记录归属和联系人绑定不会断。
+    ///
+    /// 标题读不出来时（nil）退回随机 id：那说明这一帧无法确认是谁，不能瞎认领。
+    private func identity(for title: String?) -> UUID {
+        guard let title, !ChatLayoutParser.isTransientTitle(title) else { return UUID() }
+        let key = TextMatch.normalize(title)
+        guard !key.isEmpty else { return UUID() }
+        if let existing = conversationIdentities[key] {
+            conversationIdentityOrder.removeAll { $0 == key }
+            conversationIdentityOrder.append(key)
+            return existing
+        }
+        let id = UUID()
+        conversationIdentities[key] = id
+        conversationIdentityOrder.append(key)
+        // 只记最近用过的若干个会话，多了会一直占内存。被淘汰的会话下次当新会话看待。
+        while conversationIdentityOrder.count > Self.rememberedConversations {
+            let dropped = conversationIdentityOrder.removeFirst()
+            if let evicted = conversationIdentities.removeValue(forKey: dropped) {
+                segmentOwner = segmentOwner.filter { $0.value != evicted }
+            }
+        }
+        return id
     }
 
     private func resetConversation() {
         stitcher.reset()
+        conversationIdentities.removeAll()
+        conversationIdentityOrder.removeAll()
+        segmentOwner.removeAll()
         currentMessages = []
         currentHistoryIDs = []
         currentFrameItems = []

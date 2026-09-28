@@ -217,21 +217,35 @@ nonisolated struct ChatLayoutParser {
         // 聊天页打分。聊天气泡两侧有头像，几乎不贴屏幕边缘；会话列表、文章、朋友圈大量贴边。
         let messages = bubbles.filter { $0.kind == .message }
         let sided = messages.filter { $0.side != .unknown && $0.sideConfidence >= 0.75 }
+        let bothSides = sided.contains { $0.side == .me } && sided.contains { $0.side == .other }
         var score = min(Double(messages.count), 4) * 0.1
         score += edgeRatio <= 0.1 ? 0.25 : (edgeRatio <= 0.25 ? 0.1 : -0.3)
         score += sided.isEmpty ? 0 : 0.2
-        score += sided.contains { $0.side == .me } && sided.contains { $0.side == .other } ? 0.15 : 0
+        score += bothSides ? 0.15 : 0
         score += titleLine == nil ? 0 : 0.1
         score += bottomDetected ? 0.05 : 0
         score += timeBubbles.isEmpty ? 0 : 0.05
 
+        // 输入栏是半透明压在壁纸/图片上时（TEAMBOOM 这类）找不到纯色边界，`bottomDetected`
+        // 会漏。版式证据足够强时放行：两侧都分出气泡、有标题、消息够多、文字不贴边。
+        // 阈值按真实截图量出来：真聊天页 edge≈0.11，误判的邮件页 0.24、行情页 0.31。
+        let strongLayout = bothSides && titleLine != nil && messages.count >= 10 && edgeRatio <= 0.15
+
         let reason: String?
         if messages.isEmpty {
             reason = "没有识别到聊天气泡"
+        } else if !bottomDetected, !strongLayout {
+            // 聊天页必有输入栏。邮件详情、设置页、行情页都可能凑够气泡数和留白分，
+            // 但它们没有贴在底部的输入栏——这一条把它们挡在外面。
+            reason = "底部没有输入栏"
         } else if score < 0.6 {
             reason = edgeRatio > 0.25 ? "版式不像聊天页（文字贴边较多）" : "聊天页特征不足"
         } else {
             reason = nil
+        }
+        if ProcessInfo.processInfo.environment["SEEU_LAYOUT_DEBUG"] != nil {
+            print("LAYOUT edge=\(edgeRatio) score=\(score) both=\(bothSides) titled=\(titleLine != nil) "
+                + "msgs=\(messages.count) bar=\(bottomDetected) strong=\(strongLayout) title=\(title ?? "-")")
         }
         return result(score: score, title: title, top: contentTop, bottom: contentBottom,
                       bubbles: bubbles, keyboard: keyboardTop != nil, reason: reason)

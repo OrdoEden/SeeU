@@ -57,6 +57,20 @@ nonisolated final class ChatStitcher {
         last = nil
     }
 
+    /// 只保留这些片段，其余丢掉。用于会话身份被淘汰后回收它留下的片段——
+    /// 那些段不会再有人回来认领，留着只会占内存。
+    func keepSegments(_ keeping: Set<UUID>) {
+        guard segments.contains(where: { !keeping.contains($0.id) }) else { return }
+        segments.removeAll { !keeping.contains($0.id) }
+        chain.removeAll { !keeping.contains($0) }
+        if let currentSegmentID, !keeping.contains(currentSegmentID) {
+            self.currentSegmentID = chain.first ?? segments.last?.id
+        }
+        // 上一帧可能属于被丢掉的段，位置参考不能再用。
+        if let last, !keeping.contains(last.segmentID) { self.last = nil }
+        refreshLiveFlags()
+    }
+
     /// 链上的段按“从最新到最早”排列。
     var chainedSegments: [TranscriptSegment] {
         chain.compactMap { id in segments.first { $0.id == id } }
@@ -194,7 +208,7 @@ nonisolated final class ChatStitcher {
         currentSegmentID = segment.id
         lastCaptureAt = frame.capturedAt
         last = Last(segmentID: segment.id, offset: 0, bitmap: bitmap, region: region,
-                    top: frame.contentTop, bottom: frame.contentBottom, scrollDelta: 0)
+                    top: frame.contentTop, bottom: frame.contentBottom, scrollDelta: direction ?? 0)
         // 新段的第一帧：位置就是它自己，没有可比对的对象，以文字证据为准。
         let changed = merge(frame, offset: 0, into: segments.count - 1, textBacked: true)
         guard let placed = segments.firstIndex(where: { $0.id == segment.id }) else { return nil }
@@ -463,7 +477,10 @@ nonisolated final class ChatStitcher {
                 if entry.senderName == nil { entry.senderName = bubble.senderName }
                 if entry.text != before || entry.quote != beforeQuote { changed = true }
                 // 和已有条目在同位置对上了文字，这条就是真的。
-                if !entry.textConfirmed, !entry.clipped || textBacked {
+                // 被裁切的气泡拿不到文字佐证（贴着输入栏的最后一条最常见），
+                // 同一槽位再看一次就够：真实消息会跟着聊天一起滚，位置是稳定的。
+                // ponytail: 两次观察即确认；若回放里出现图片小字混进上下文，再给 clipped 加文字相似度门槛。
+                if !entry.textConfirmed, !entry.clipped || textBacked || entry.observations >= 2 {
                     entry.textConfirmed = true
                     changed = true
                 }

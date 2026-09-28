@@ -105,9 +105,12 @@ final class ReplayTests: XCTestCase {
             case nil: place = "-"
             }
             let side = tail.map { $0.side == .me ? "我" : ($0.side == .other ? "对方" : "?") } ?? ""
+            // 会话标识只看前 4 位：回放里最该发现的是"会话被重置了"，不是具体是哪个会话。
+            let conversation = update.conversationID.map { String($0.uuidString.prefix(4)) } ?? "-"
             log.append(String(
-                format: "%@ %@ %@ place=%@ img=%@ rev=%d live=%@ iso=%@ ctx=%d tail=%@:%@%@",
-                url.deletingPathExtension().lastPathComponent, keyboard, detection, place, image, update.revision,
+                format: "%@ %@ %@ conv=%@ place=%@ img=%@ rev=%d live=%@ iso=%@ ctx=%d tail=%@:%@%@",
+                url.deletingPathExtension().lastPathComponent, keyboard, detection, conversation,
+                place, image, update.revision,
                 update.viewingLiveTail ? "y" : "n", update.currentContextIsIsolated ? "y" : "n",
                 update.contextMessages.filter { $0.kind == .message }.count, side,
                 String((tail?.text ?? "").prefix(24)), isNew ? "  ◀︎ 新消息" : ""
